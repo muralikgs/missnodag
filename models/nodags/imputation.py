@@ -161,7 +161,6 @@ def check_acceptance(
     # k Q(x_m) >= P(x_m, x_o, r)
     # k = torch.exp(log_p_joint_dis.view(-1)[accepted] - log_q_cond_dis[accepted]).max()
     # dele_index = []
-    # 
     k = ((1 - accepted*1.0)*torch.exp(log_p_joint_dis.view(-1) - log_q_cond_dis)).max()
 
     prob_upper_lim = torch.exp(
@@ -232,4 +231,4 @@ def impute_mcmc_rejection(
         if accepted.sum() >= min_accept_factor * nr:
             return X_imputed[accepted], accepted, t, k_list
 
-    return X_imputed[accepted], accepted, t, k_list
+    return X_imputed[accepted], accepted, max_repetitions, k_list

@@ -1,5 +1,7 @@
 import numpy as np 
 import networkx as nx
+import random 
+import itertools
 
 class DirectedGraphGenerator:
     """
@@ -49,3 +51,44 @@ class DirectedGraphGenerator:
             self.cyclic = not nx.is_directed_acyclic_graph(self.g)
 
         return self.g
+
+
+def cyclic_graph_generator(n_nodes, expected_density, num_cycles):
+
+    def add_random_cycle(G: nx.DiGraph, cycle_length: int):
+        nodes = random.sample(list(G.nodes), cycle_length)
+        for i in range(cycle_length):
+            G.add_edge(nodes[i], nodes[(i+1) % cycle_length])
+
+    p = expected_density / n_nodes 
+
+    G = nx.DiGraph()
+    G.add_nodes_from(range(n_nodes))
+
+    for i in range(num_cycles):
+        L = random.randint(2, min(n_nodes, 3))
+        add_random_cycle(G, L)
+    
+    # Fill in the remaining edges
+    total_edges = int(p * n_nodes * n_nodes)
+    existing_edges = set(G.edges)
+    remaining = total_edges - len(existing_edges)
+
+    all_possible_edges = list(itertools.permutations(range(n_nodes), 2))
+    random.shuffle(all_possible_edges)
+
+    for u, v in all_possible_edges:
+        if (u, v) in existing_edges:
+            continue
+
+        # check if there is a path from v to u
+        if nx.has_path(G, v, u):
+            continue 
+
+        G.add_edge(u, v)
+        existing_edges.add((u, v))
+        remaining -= 1
+        if remaining <= 0:
+            break
+
+    return G

@@ -6,15 +6,19 @@ import time
 
 from models.nodags.functions import gumbelSoftMLP
 
-def standard_normal_logprob(z, noise_scales):
-    logZ = -0.5 * torch.log(2 * math.pi * (noise_scales**(2)))#(noise_scales.pow(2))) # change this back to pow
-    return logZ - z.pow(2) / (2 * (noise_scales**(2)))
-
-def dag_constraint(W, s=1, method='log-det'):
+def dag_constraint(W, s=1, method='expm'):
     if method == 'expm':
         return torch.trace(torch.matrix_exp(W * W)) - W.shape[0]
     elif method == 'log-det':
         return -torch.log(s * torch.det(torch.eye(W.shape[0], device=W.device) - W * W)) + W.shape[0] * math.log(s)
+    else:
+        return torch.tensor(-1.0)
+
+def standard_normal_logprob(z, noise_scales):
+    logZ = -0.5 * torch.log(2 * math.pi * (noise_scales**(2)))#(noise_scales.pow(2))) # change this back to pow
+    return logZ - z.pow(2) / (2 * (noise_scales**(2)))
+
+
 
 class iResBlock(nn.Module):
     """
@@ -49,7 +53,6 @@ class iResBlock(nn.Module):
         grad_in_forward=False, 
         n_exact_terms=2, 
         single_var=False,
-        precondition=False, # Must be true when the input is DAG 
         lin_logdet=False, 
         centered=True
     ):
@@ -64,7 +67,6 @@ class iResBlock(nn.Module):
         self.grad_in_forward = grad_in_forward
         self.n_exact_terms = n_exact_terms
         self.n_samples = n_samples
-        self.precondition = precondition
         self.lin_logdet = lin_logdet
         self.centered = centered
         
@@ -82,8 +84,7 @@ class iResBlock(nn.Module):
             # device = torch.device('cpu')
             self.mu = torch.zeros(self.f.n_nodes).float().to(device)
 
-        if precondition:
-            self.Lambda = nn.Parameter(torch.zeros(self.f.n_nodes).float())
+        self.Lambda = nn.Parameter(torch.zeros(self.f.n_nodes).float())
 
     def forward(self, x, mask, logdet=False, neumann_grad=True):
         # set intervention set to [None]
@@ -94,37 +95,25 @@ class iResBlock(nn.Module):
             y = x - self.f(x) * mask
             return y
         else:
-            if self.precondition:
-                Lamb_mat = torch.diag(torch.exp(self.Lambda))
-                Lamb_mat_inv = torch.diag(1/torch.exp(self.Lambda))
-                # print(x.device, self.mu.device, Lamb_mat.device)
-                x_inp = (x - self.mu) @ Lamb_mat
+            Lamb_mat = torch.diag(torch.exp(self.Lambda))
+            Lamb_mat_inv = torch.diag(1/torch.exp(self.Lambda))
+            x_inp = (x - self.mu) @ Lamb_mat
     
-            else:
-                x_inp = x - self.mu
             f_x, logdetgrad, _ = self._logdetgrad(x_inp, mask)
-            if self.precondition:
-                return (x - self.mu) - (f_x @ Lamb_mat_inv) * mask, logdetgrad
-            else:
-                return (x - self.mu) - f_x * mask, logdetgrad 
+            return (x - self.mu) - (f_x @ Lamb_mat_inv) * mask, logdetgrad
 
     def predict_from_latent(self, latent_vec, mask, x_init=None, n_iter=20, threshold=1e-4):
         x = torch.randn(latent_vec.size(), device=latent_vec.device)
         mask_cmp = torch.ones_like(mask) - mask
         c = x_init * mask_cmp
 
-        if self.precondition:
-            Lamb_mat = torch.diag(torch.exp(self.Lambda))
-            Lamb_mat_inv = torch.diag(1/torch.exp(self.Lambda))
+        Lamb_mat = torch.diag(torch.exp(self.Lambda))
+        Lamb_mat_inv = torch.diag(1/torch.exp(self.Lambda))
 
         for _ in range(n_iter):
             x_t = x
-            x_inp = x - self.mu 
-            if self.precondition:
-                x_inp = (x - self.mu) @ Lamb_mat
-                f_x = self.f(x_inp) @ Lamb_mat_inv
-            else:
-                f_x = self.f(x_inp)
+            x_inp = (x - self.mu) @ Lamb_mat
+            f_x = self.f(x_inp) @ Lamb_mat_inv
 
             x = f_x * mask + (latent_vec + self.mu) * mask + c 
             if torch.norm(x_t - x) < threshold:
@@ -215,21 +204,17 @@ class iResBlock(nn.Module):
             l1_norm = sum(p.abs().sum() for p in self.parameters())
 
         loss_pen = loss + lambda_c * l1_norm
-
+        
+        h_w = -1.0
         if obs:
-            if fun_type == "gst-mlp":
-                h_w = dag_constraint(self.f.get_w_adj().abs(), s=s, method=method)
-            elif fun_type == "lin-mlp":
-                w = self.f.layer.weight.T
-                h_w = dag_constraint(w, method=method)
+            h_w = dag_constraint(self.f.get_w_adj().abs(), s=s, method=method)
 
-            loss_pen += lambda_dag * h_w
-            return loss_pen, loss, torch.mean(logdetgrad), h_w
+        loss_pen += lambda_dag * h_w
 
-        return loss_pen, loss, torch.mean(logdetgrad)
+        return loss_pen, loss, torch.mean(logdetgrad), h_w
     
     def neg_log_likelihood(self, x, mask):
-        _, nll, _ = self.losses(x, mask, neumann_grad=False)
+        _, nll, _, _ = self.losses(x, mask, neumann_grad=False)
         return nll
 
     def get_w_adj(self):

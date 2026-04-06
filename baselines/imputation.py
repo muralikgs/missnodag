@@ -1,6 +1,7 @@
 import torch
 import sys
 import sklearn.neighbors._base
+import numpy as np
 sys.modules['sklearn.neighbors.base'] = sklearn.neighbors._base
 
 from baselines.optimal_transport.imputers import OTimputer
@@ -8,11 +9,12 @@ from baselines.optimal_transport.imputers import OTimputer
 from missingpy import MissForest
 
 def mean_impute(dataset, missing):
-    mean = (dataset * missing).sum(axis=0) / missing.sum(axis=0)
-    
-    dataset_imputed = dataset * missing + (1 - missing) * mean
+    final_dataset = dataset 
+    col_mean = np.nanmean(final_dataset, axis=0)
 
-    return dataset_imputed 
+    inds = np.where(np.isnan(final_dataset))
+    final_dataset[inds] = np.take(col_mean, inds[1])
+    return final_dataset 
 
 def missforest_impute(dataset, missing):
 

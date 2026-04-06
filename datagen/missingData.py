@@ -3,8 +3,26 @@ from torch.utils.data import Dataset
 import torch
 from scipy import optimize
 import networkx as nx
+import torch.nn as nn 
 
-from datagen.structuralModels import linearSEM
+from datagen.graph import DirectedGraphGenerator
+from datagen.structuralModels import SEM
+
+
+def generate_R2R_DAG(n_nodes, expected_density=1):
+    graph_gen = DirectedGraphGenerator(
+        nodes=n_nodes, 
+        expected_density=expected_density,
+        enforce_dag=True
+    )
+
+    return graph_gen()
+
+def make_MNAR_identifiable(r2r_adj, x2r_adj):
+    # check for colluders
+    colluder_mask = r2r_adj * x2r_adj 
+
+    return r2r_adj * (1 - colluder_mask) # removes the colluders by removing edges from R->R matrix
 
 def generate_mar_mask(X, p, p_obs):
     n, d = X.shape
@@ -52,44 +70,29 @@ def pick_coeffs(X, idxs_obs=None, idxs_nas=None, self_mask=False):
         coeffs /= torch.std(Wx, 0, keepdim=True)
     return coeffs
 
-
-def fit_intercepts(X, coeffs, p, self_mask=False):
-    if self_mask:
-        d = len(coeffs)
-        intercepts = torch.zeros(d)
-        for j in range(d):
-            def f(x):
-                return torch.sigmoid(X * coeffs[j] + x).mean().item() - p
-
-            intercepts[j] = optimize.bisect(f, -50, 50)
-    else:
-        d_obs, d_na = coeffs.shape
-        intercepts = torch.zeros(d_na)
-        for j in range(d_na):
-            def f(x):
-                return torch.sigmoid(X.mv(coeffs[:, j]) + x).mean().item() - p
-
-            intercepts[j] = optimize.bisect(f, -50, 50)
-    return intercepts
-
 class mgraph:
 
     def __init__(
             self, 
             obs_graph: nx.DiGraph, 
-            sem: linearSEM, 
+            sem: SEM, 
             missing_model='obs-only',
             p=0.2,
             max_variance=2.0,
             is_mcar=False,
             max_child=3,
             scaling_data_given=False,
-            scaling_data=None
+            scaling_data=None,
+            mlp=False
     ):
         '''
+        Args:
         misssing_model - determines the structure of connections to the missingness indicators. It can be either "full" or "obs-only".
-        "obs-only" - In this case, the parents of r_i are restricted to the set x_{-i}. We assume no self-consoring
-        "full" - This produces a graph where we have edges from r_{i+1} -> r_i aside from the ones allowed by the setting "obs-only"
+                        Choose between the following options: 
+                        "obs-only" - In this case, the parents of r_i are restricted to the set x_{-i}. We assume no self-consoring
+                        "full" - This produces a graph where we have edges from r_{i+1} -> r_i aside from the ones 
+                                 allowed by the setting "obs-only"
+                        "violate" - This produces a graph that violates the identifiability criteria for the missingness mechanism
         '''
         
         self.obs_graph = obs_graph
@@ -97,6 +100,7 @@ class mgraph:
         self.missing_mode = missing_model
         self.p = p
         self.is_mcar = is_mcar
+        self.mlp = mlp
 
         # define the missingness graph
 
@@ -107,13 +111,14 @@ class mgraph:
         # make the coefficients matrix sparse
         sparsity_mask = generate_random_binary_matrix(self.sem.n_nodes, self.sem.n_nodes, max_ones_per_col=max_child)
         self.m_coefs = self.m_coefs * sparsity_mask
+        self.m_coefs_r2r = np.zeros_like(self.m_coefs)
 
-        if self.missing_mode == "full":
-            # define the weights between r_i and r_{i+1}
-            r_coefs = np.zeros_like(self.m_coefs)
-            r_coefs[np.arange(1, self.sem.n_nodes), np.arange(self.sem.n_nodes - 1)] = np.random.randn(self.sem.n_nodes - 1)
+        if self.missing_mode == "full" or self.missing_mode == "violate":
+            r2r_graph = nx.to_numpy_array(generate_R2R_DAG(sem.n_nodes))
+            r2r_adj = make_MNAR_identifiable(r2r_graph, 1.0*(np.abs(self.m_coefs) > 0))
 
-            self.m_coefs = np.vstack([self.m_coefs, r_coefs])
+            # if "violate" option is chosen, then no-colluder condition need not be satisfied
+            self.m_coefs_r2r = r2r_adj if self.missing_mode == "full" else r2r_graph
         
         # intercepts for the sigmoid function. The intercepts are set such that the probability
         # of a node being missing is on an average equal to the argument "p"
@@ -121,10 +126,11 @@ class mgraph:
 
         # re-adjusting the parameters such that the variance of W^\top (x,r) is around `max_variance`,
         # currently ignoring the contribution from the parents of r_i that are also missingness indicators. 
-        if not scaling_data_given:
-            test_data = sem.generateData(n_samples=1000, intervention_set=[None])
-        else:
+
+        if scaling_data_given:
             test_data = scaling_data
+        else:
+            test_data = sem.generateData(n_samples=1000, intervention_set=[None])
         
         wtx = test_data @ self.m_coefs[:self.sem.n_nodes, :]
         arg_var = np.var(wtx, axis=0, keepdims=True)
@@ -133,16 +139,65 @@ class mgraph:
         if self.is_mcar: 
             self.m_coefs = np.zeros_like(self.m_coefs)
 
+        if self.missing_mode == "violate":
+            # incase the "violate" option is chosen, 30% of the nodes (randomly chosen) are made to be self-censored
+            censored_nodes = np.random.choice(self.sem.n_nodes, size=int(0.3*self.sem.n_nodes), replace=False)
+            self.m_coefs[censored_nodes, censored_nodes] = 0.3
+
+        if self.mlp:
+            self.function = nn.Sequential(
+                nn.Linear(in_features=2*self.sem.n_nodes, out_features=self.sem.n_nodes),
+                nn.Linear(in_features=self.sem.n_nodes, out_features=self.sem.n_nodes),
+                nn.Sigmoid()
+            )
+
+
+    def func(self, X, R):
+        
+        if not self.mlp:
+            p_R_0 = sigmoid(
+                        X @ self.m_coefs + (1-R) @ self.m_coefs_r2r + self.m_intercept
+                    )
+        
+        else:
+            W_xr = torch.tensor(np.abs(self.m_coefs) > 0).float()
+            W_rr = torch.tensor(np.abs(self.m_coefs_r2r) > 0).float()
+
+            X, R = torch.tensor(X).float(), torch.tensor(R).float()
+            p_R_0 = torch.zeros_like(R)
+            for i in range(self.sem.n_nodes):
+                par_x = torch.diag(W_xr[:, i])
+                par_r = torch.diag(W_rr[:, i])
+                
+                xr_concat = torch.cat([X @ par_x, R @ par_r], dim=1)
+                p_R_0_i = self.function(xr_concat)[:, i]
+
+                p_R_0[:, i] = p_R_0_i.squeeze()
+            
+            p_R_0 = p_R_0.detach().numpy()
+
+        return p_R_0
+
     def generatemDataFromSamples(self, X, intervention_set=[None]):
 
         if self.is_mcar:
             R = generate_mar_mask(X, self.p, p_obs=0.3)
         else:
-            p_R_0 = sigmoid(
-                X @ self.m_coefs + self.m_intercept
-            )
+            if self.missing_mode == "full":
+                G = nx.from_numpy_array(self.m_coefs_r2r, create_using=nx.DiGraph)
+                topo_order = list(nx.topological_sort(G))
+                R = np.ones_like(X)
+                for node in topo_order:
+                    p_R_0 = self.func(X, R)
+                    R_t = np.random.binomial(n=1, p=1-p_R_0, size=X.shape)
+                    R[:, node] = R_t[:, node]
 
-            R = np.random.binomial(n=1, p=1-p_R_0, size=X.shape)
+            else:
+                # defines the probability that a variable is missing, R_i = 0 indicates X_i is missing
+                p_R_0 = sigmoid(
+                    X @ self.m_coefs + self.m_intercept
+                )
+                R = np.random.binomial(n=1, p=1-p_R_0, size=X.shape)
             
             # ensuring that non of the intervened upon nodes are missing
             intervention_mask = np.zeros_like(R)
